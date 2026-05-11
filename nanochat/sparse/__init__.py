@@ -17,6 +17,7 @@ from nanochat.sparse.sparse_mlp import (
     sparse_cache_stats,
     init_all_router_weights,
     assert_state_dict_consistency,
+    gather_router_params,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "sparse_cache_stats",
     "init_all_router_weights",
     "assert_state_dict_consistency",
+    "gather_router_params",
 ]

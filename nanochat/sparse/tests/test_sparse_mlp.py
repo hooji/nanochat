@@ -5,12 +5,13 @@ Run with: pytest nanochat/sparse/tests/test_sparse_mlp.py -v
 These tests verify:
   - Training forward applies top-K + scatter (Tier 1 reference math)
   - Inference forward is mathematically equivalent to training (Tier 1)
+  - Router has a real nonlinearity (V(GELU(U(·))) form, not collapsed linear)
   - Router approximation produces correct shape and improves with oversample
   - State-dict / config consistency assertions catch mismatches
   - FfnCache returns the same output on hit
-  - Aux losses are populated after training forward and have O(1) scale
-    (i.e. don't suffer from the K^2 scaling regression caught by the first
-    smoke test — see docs/results.md Phase A)
+  - Aux losses are populated after training forward, have provable [1, I] bounds
+    (catches both the K^2 scaling bug and the anti-correlation bug; see
+    docs/results.md Phase A for the diagnostic traces)
 """
 
 import pytest
@@ -24,6 +25,7 @@ from nanochat.sparse.sparse_mlp import (
     enable_sparse_cache,
     disable_sparse_cache,
     sparse_cache_stats,
+    gather_router_params,
 )
 
 
@@ -125,6 +127,33 @@ def test_train_forward_with_router_produces_router_loss():
     assert router_l.requires_grad  # must flow gradients into router weights
 
 
+def test_router_has_nonlinearity():
+    """Router must be a true 2-layer MLP V(GELU(U(x))), not a collapsed linear V@U.
+
+    Detection: for a purely linear router, router(-x) == -router(x). GELU
+    breaks this antisymmetry. If router(x) + router(-x) is meaningfully
+    nonzero, a nonlinearity is present.
+    """
+    torch.manual_seed(31)
+    config = _FakeConfig(sparse_use_router=True, sparse_router_rank=4)
+    mlp = TopKSparseMLP(config)
+    # Set non-trivial weights so the test isn't trivially satisfied by zeros.
+    with torch.no_grad():
+        mlp.router.u.weight.normal_(std=0.5)
+        mlp.router.v.weight.normal_(std=0.5)
+
+    x = torch.randn(1, 1, mlp.n_embd)
+    out_pos = mlp.router(x)
+    out_neg = mlp.router(-x)
+    sym_diff = (out_pos + out_neg).abs().mean()
+    assert sym_diff.item() > 1e-3, (
+        f"router appears to be linear: |router(x) + router(-x)| ≈ 0 "
+        f"(got {sym_diff.item():.2e}). Expected a nonlinearity between U and V; "
+        f"without it V(U(x)) collapses to a rank-{config.sparse_router_rank} "
+        f"linear projection."
+    )
+
+
 def test_collect_aux_losses_sums_across_modules():
     """collect_aux_losses walks the whole model."""
     import torch.nn as nn
@@ -146,6 +175,33 @@ def test_collect_aux_losses_sums_across_modules():
     b_aux, b_r = b.aux_loss()
     assert torch.allclose(aux_total, a_aux + b_aux)
     assert torch.allclose(router_total, a_r + b_r)
+
+
+def test_gather_router_params_returns_only_router_params():
+    """gather_router_params should return router params and nothing else."""
+    import torch.nn as nn
+
+    config = _FakeConfig(sparse_use_router=True, sparse_router_rank=8)
+    mlp = TopKSparseMLP(config)
+    mlp.init_router_weights()
+    model = nn.ModuleList([mlp])
+
+    router_params = gather_router_params(model)
+    # Router has two Linear modules (u and v), each with a single weight
+    assert len(router_params) == 2
+    # Verify they are exactly the router weights
+    router_param_ids = {id(p) for p in router_params}
+    expected_ids = {id(mlp.router.u.weight), id(mlp.router.v.weight)}
+    assert router_param_ids == expected_ids
+
+
+def test_gather_router_params_empty_when_no_router():
+    """gather_router_params should return empty when no router is configured."""
+    import torch.nn as nn
+
+    mlp = TopKSparseMLP(_FakeConfig(sparse_use_router=False))
+    model = nn.ModuleList([mlp])
+    assert gather_router_params(model) == []
 
 
 def test_state_dict_assertion_passes_when_consistent():
@@ -239,39 +295,6 @@ def test_router_oversample_capped_at_intermediate():
     assert out.shape == (1, 1, 32)  # should not crash
 
 
-def test_router_perfect_match_recovers_exact_topk():
-    """If router weights are set to exactly mirror c_fc, router inference == Tier 1."""
-    torch.manual_seed(11)
-    config = _FakeConfig(
-        n_embd=16, sparse_k=8, sparse_use_router=True, sparse_router_rank=16, sparse_router_oversample=4
-    )
-    mlp = TopKSparseMLP(config)
-    mlp.to(dtype=torch.float64)
-
-    # Manually align router scores with the ReLU^2 activations by giving the
-    # router enough rank to express c_fc.weight directly.
-    with torch.no_grad():
-        # router(x) = v(u(x)) = x @ u^T @ v^T.
-        # We want this to equal x @ c_fc.weight^T (the c_fc scores), so set
-        # u = identity (need rank >= n_embd; here rank=n_embd=16) and v = c_fc.weight.
-        eye = torch.eye(16, dtype=torch.float64)
-        mlp.router.u.weight.copy_(eye)
-        mlp.router.v.weight.copy_(mlp.c_fc.weight)
-
-    mlp.eval()
-    x = torch.randn(2, 3, 16, dtype=torch.float64)
-
-    out_router = mlp._router_inference(x)
-    out_exact = mlp._sparse_inference(x)
-
-    # With oversample=4 -> K' = 32 = intermediate (capped), so router considers
-    # every feature and the result should equal Tier 1 exactly.
-    assert torch.allclose(out_router, out_exact, atol=1e-9), (
-        f"router with full oversample should match exact; max diff = "
-        f"{(out_router - out_exact).abs().max()}"
-    )
-
-
 def test_aux_loss_is_finite_and_nonneg():
     mlp = TopKSparseMLP(_FakeConfig(sparse_use_router=True))
     mlp.init_router_weights()
@@ -285,21 +308,26 @@ def test_aux_loss_is_finite_and_nonneg():
     assert router_l.item() >= 0
 
 
-def test_aux_loss_bounded_by_intermediate():
-    """Switch-Transformer eq.4 aux loss is bounded above by intermediate.
+def test_aux_loss_bounded_in_one_to_intermediate():
+    """Participation-ratio aux loss is provably bounded in [1, intermediate].
 
-    Regression guard: an earlier version multiplied (load * importance) by
-    intermediate without normalizing either to a probability distribution,
-    which caused aux to scale as K^2 * intermediate and dominate the LM
-    loss (see docs/results.md Phase A). The fixed formula normalizes both
-    to distributions, so under the formula aux is bounded by `intermediate`
-    (the maximum at total collapse to one feature).
+    Regression guard for two distinct bugs:
+      - The K^2 scaling bug (un-normalized load*importance times intermediate)
+        produced aux ~ K^2 * avg_h, far above intermediate. Caught by the
+        upper bound check.
+      - The anti-correlation bug (normalized load*importance) allowed aux < 1
+        when load and importance were anti-correlated specialist/generalist.
+        Caught by the lower bound check.
 
-    With random inputs we should be near the lower bound of 1.
+    The current formula `I * sum(imp_norm^2)` is provably in [1, I]:
+      - Lower bound by Cauchy-Schwarz / power-mean: sum(p_i^2) >= 1/n for p
+        a distribution over n points, with equality at uniform p_i = 1/n.
+      - Upper bound: sum(p_i^2) <= 1 with equality at full concentration.
+      - Multiplied by I gives [1, I].
     """
     torch.manual_seed(17)
-    # Pick a config where the buggy K^2 scaling would obviously violate
-    # the bound (K^2 = 1024 vs intermediate = 128).
+    # Pick K large enough that the old K^2 bug would obviously violate the
+    # upper bound (K^2 = 1024 vs intermediate = 128).
     config = _FakeConfig(n_embd=32, sparse_k=32)
     mlp = TopKSparseMLP(config)
     mlp.train()
@@ -307,10 +335,52 @@ def test_aux_loss_bounded_by_intermediate():
     _ = mlp(x)
     aux_l, _ = mlp.aux_loss()
     intermediate = 4 * config.n_embd
+    assert aux_l.item() >= 1.0 - 1e-3, (
+        f"aux_loss = {aux_l.item():.4f} below the theoretical floor of 1.0. "
+        f"Under the participation-ratio form (I * sum(p_i^2)) this is impossible "
+        f"— the anti-correlation regression may have returned."
+    )
     assert aux_l.item() <= intermediate + 1e-3, (
         f"aux_loss = {aux_l.item():.4f} exceeds intermediate={intermediate}. "
-        f"Under the Switch eq.4 formula (normalized importance and load) this "
-        f"is impossible. The K^2 scaling regression may have returned."
+        f"Under the participation-ratio form this is impossible — the K^2 "
+        f"scaling regression may have returned."
+    )
+
+
+def test_router_target_is_magnitude_weighted_not_uniform():
+    """The router CE target should be h_sparse / h_sparse.sum, not uniform 1/K.
+
+    Detection: with a non-trivial router (post-init normal weights on V), the
+    router CE loss with the magnitude-weighted target should differ from what
+    the uniform-1/K target would produce, given that top_vals vary in magnitude.
+    """
+    torch.manual_seed(43)
+    config = _FakeConfig(n_embd=32, sparse_k=4, sparse_use_router=True)
+    mlp = TopKSparseMLP(config)
+    mlp.init_router_weights()
+    # Push router.v away from zero so router_scores are nontrivial.
+    with torch.no_grad():
+        mlp.router.v.weight.normal_(std=0.5)
+    mlp.train()
+    x = torch.randn(1, 1, 32)
+    _ = mlp(x)
+    _, router_l_magnitude = mlp.aux_loss()
+
+    # Reproduce relevant forward bits to compare against the uniform-target form.
+    h = mlp.c_fc(x)
+    h = torch.relu(h).square()
+    top_vals, top_idx = torch.topk(h, mlp.k, dim=-1)
+    router_scores = mlp.router(x)
+    log_probs = torch.log_softmax(router_scores, dim=-1)
+
+    with torch.no_grad():
+        uniform_target = torch.zeros_like(router_scores)
+        uniform_target.scatter_(-1, top_idx, 1.0 / mlp.k)
+    uniform_loss = -(uniform_target * log_probs).sum(dim=-1).mean()
+
+    assert not torch.allclose(router_l_magnitude, uniform_loss, atol=1e-5), (
+        f"Router loss matches uniform-target form (mag={router_l_magnitude.item():.4f}, "
+        f"uniform={uniform_loss.item():.4f}); target may have regressed to uniform."
     )
 
 

@@ -14,10 +14,10 @@ Three tiers, all opt-in via GPTConfig flags:
                      inference path skips the dense c_proj matmul in favor of
                      a K-sparse gather.
 
-  Tier 2 (Router):   A low-rank predictor learns to identify the active set
-                     before c_fc. At inference, only K' = K * oversample rows
-                     of c_fc are computed (gather instead of full matmul).
-                     Approximation controlled by router_oversample.
+  Tier 2 (Router):   A two-layer MLP (V(GELU(U(·)))) learns to identify the
+                     active set before c_fc. At inference, only K' = K *
+                     oversample rows of c_fc are computed (gather instead of
+                     full matmul). Approximation controlled by router_oversample.
 
   Tier 3 (FfnCache): Hashes the top-K index set, caches the projection output.
                      Inference-only, off by default, enable via helper.
@@ -39,11 +39,13 @@ from nanochat.gpt import Linear
 
 
 class Router(nn.Module):
-    """Low-rank predictor of which intermediate features will fire.
+    """Two-layer MLP predictor of which intermediate features will fire.
 
-    Computes a score per intermediate feature as V(U(x)) where U is
-    [n_embd, rank] and V is [rank, intermediate]. The caller selects the
-    top-K' candidates and computes c_fc only on those rows.
+    Computes V(GELU(U(x))) where U: [n_embd, rank], V: [rank, intermediate].
+    The GELU nonlinearity is essential: without it, V(U(x)) collapses to a
+    single rank-`rank` linear projection (V @ U), with no expressivity beyond
+    a single matmul of bounded rank. That formulation stalled router learning
+    at K=512 on d12 in the first smoke test — see docs/results.md.
     """
 
     def __init__(self, n_embd: int, intermediate: int, rank: int):
@@ -52,7 +54,7 @@ class Router(nn.Module):
         self.v = Linear(rank, intermediate, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.v(self.u(x))
+        return self.v(F.gelu(self.u(x)))
 
 
 class FfnCache:
@@ -169,7 +171,7 @@ class TopKSparseMLP(nn.Module):
         Convention:
           - router.u: uniform with std = 1/sqrt(n_embd) (same scale as Q/K/V)
           - router.v: zero init so the router starts neutral; cross-entropy
-            against true top-K shapes it during training.
+            against the magnitude-weighted top-K shapes it during training.
         """
         if self.router is None:
             return
@@ -217,38 +219,41 @@ class TopKSparseMLP(nn.Module):
         h_sparse = torch.zeros_like(h)
         h_sparse.scatter_(-1, top_idx, top_vals)               # K-nonzero per row
 
-        # Load-balancing aux loss (Switch-Transformer eq. 4, Fedus et al. 2022).
+        # Load-balancing aux loss — participation-ratio (inverse Simpson) form.
         #
-        # Switch's L_aux = N * sum_i(f_i * P_i), where f and P are both
-        # probability distributions over N experts:
-        #   f_i = fraction of tokens routed to expert i      (sum_i f_i = 1)
-        #   P_i = mean router gate probability for expert i   (sum_i P_i = 1)
-        # Under uniform routing this gives aux = N * sum(1/N^2) = 1.
-        # Under collapse to one expert it gives aux = N.
+        # Use the squared L2 norm of the normalized importance distribution.
+        # Bounded in [1, intermediate]:
+        #   - 1 at uniform imp_norm = 1/I (minimum, by power-mean inequality)
+        #   - I at full collapse to one feature (maximum)
+        # Monotonic in concentration: any deviation from uniform increases aux.
         #
-        # For TopK FFN the analogs are:
-        #   load[f]       = E[1{f in top-K}] over (batch, seq)
-        #   importance[f] = E[h_sparse[f]]   over (batch, seq)
-        # Neither sums to 1 by construction (load sums to K; importance has no
-        # natural scale). Without explicit normalization the product of
-        # (load * importance) scales as K^2, and multiplying by I over-scales
-        # the loss by an additional factor — making aux dominate the LM loss
-        # for any reasonable K. This was the bug that took out the first
-        # smoke test; see docs/results.md Phase A.
+        # History: an earlier version computed `I * sum(load_norm * imp_norm)`
+        # with both normalized to distributions. By Cauchy-Schwarz, that form
+        # is minimized by *anti-correlating* load and importance (specialist +
+        # generalist split), not by uniform usage — the gradient pushed away
+        # from balance rather than toward it. See docs/results.md for the
+        # Train/Test team's diagnostic (d12 K=512 smoke test, aux observed
+        # in [0.38, 1.28] per layer, below the claimed floor of 1.0).
         importance = h_sparse.mean(dim=(0, 1))                  # [I]
-        with torch.no_grad():
-            load = (h_sparse > 0).float().mean(dim=(0, 1))      # [I]
         imp_norm = importance / (importance.sum() + 1e-9)       # sums to 1
-        load_norm = load / (load.sum() + 1e-9)                  # sums to 1
-        # aux ∈ [1, I]: 1 at uniform usage, I at total collapse to one feature.
-        self._last_aux_loss = self.intermediate * (load_norm * imp_norm).sum()
+        self._last_aux_loss = self.intermediate * (imp_norm * imp_norm).sum()
 
-        # Router training: cross-entropy of router scores against true top-K.
+        # Router training — magnitude-weighted cross-entropy against the
+        # true top-K positions (NOT uniform 1/K over the K positions).
+        #
+        # The target distribution is the normalized h_sparse magnitudes:
+        # support exactly on top_idx, mass proportional to the actual ReLU^2
+        # activation. This concentrates gradient on the highest-magnitude
+        # features the router most needs to predict. The uniform 1/K target
+        # used previously gave only ~1/K = 1/512 gradient per active feature
+        # on the K=512 smoke test — too weak to break out of the rank-64
+        # linear bottleneck. Combined with the new V(GELU(U(·))) Router
+        # this should let the router actually reach its log-K floor.
         if self.router is not None:
             router_scores = self.router(x)                      # [B, T, I]
             with torch.no_grad():
-                target = torch.zeros_like(router_scores)
-                target.scatter_(-1, top_idx, 1.0 / self.k)      # uniform over K
+                # Per-token magnitude distribution over features (K-sparse).
+                target = h_sparse / (h_sparse.sum(dim=-1, keepdim=True) + 1e-9)
             log_probs = F.log_softmax(router_scores, dim=-1)
             self._last_router_loss = -(target * log_probs).sum(dim=-1).mean()
         else:
@@ -357,6 +362,22 @@ def collect_aux_losses(model: nn.Module):
             if router_l is not None:
                 router_total = router_total + router_l
     return aux_total, router_total
+
+
+def gather_router_params(model: nn.Module) -> list:
+    """Return the list of router parameters across all TopKSparseMLPs in `model`.
+
+    Used by GPT.setup_optimizer to pull router params into separate Muon groups
+    with a higher learning rate. Router targets are non-stationary (top-K of
+    c_fc, which keeps moving), so the router needs sustained LR to keep up.
+    See docs/results.md for the diagnostic (router learning collapsed by 260x
+    between warmup and cosine-decay phases on the d12 K=512 smoke test).
+    """
+    params = []
+    for module in model.modules():
+        if isinstance(module, TopKSparseMLP) and module.router is not None:
+            params.extend(module.router.parameters())
+    return params
 
 
 def enable_sparse_cache(model: nn.Module, max_entries: int = 4096) -> int:
