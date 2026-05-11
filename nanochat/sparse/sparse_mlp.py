@@ -217,14 +217,31 @@ class TopKSparseMLP(nn.Module):
         h_sparse = torch.zeros_like(h)
         h_sparse.scatter_(-1, top_idx, top_vals)               # K-nonzero per row
 
-        # Load-balancing aux loss (Switch-Transformer style).
-        # importance: differentiable mean activation per feature
-        # load:       non-differentiable mean indicator per feature
-        # Encouraging uniform usage prevents collapse to a small subset.
+        # Load-balancing aux loss (Switch-Transformer eq. 4, Fedus et al. 2022).
+        #
+        # Switch's L_aux = N * sum_i(f_i * P_i), where f and P are both
+        # probability distributions over N experts:
+        #   f_i = fraction of tokens routed to expert i      (sum_i f_i = 1)
+        #   P_i = mean router gate probability for expert i   (sum_i P_i = 1)
+        # Under uniform routing this gives aux = N * sum(1/N^2) = 1.
+        # Under collapse to one expert it gives aux = N.
+        #
+        # For TopK FFN the analogs are:
+        #   load[f]       = E[1{f in top-K}] over (batch, seq)
+        #   importance[f] = E[h_sparse[f]]   over (batch, seq)
+        # Neither sums to 1 by construction (load sums to K; importance has no
+        # natural scale). Without explicit normalization the product of
+        # (load * importance) scales as K^2, and multiplying by I over-scales
+        # the loss by an additional factor — making aux dominate the LM loss
+        # for any reasonable K. This was the bug that took out the first
+        # smoke test; see docs/results.md Phase A.
         importance = h_sparse.mean(dim=(0, 1))                  # [I]
         with torch.no_grad():
             load = (h_sparse > 0).float().mean(dim=(0, 1))      # [I]
-        self._last_aux_loss = (load * importance).sum() * self.intermediate
+        imp_norm = importance / (importance.sum() + 1e-9)       # sums to 1
+        load_norm = load / (load.sum() + 1e-9)                  # sums to 1
+        # aux ∈ [1, I]: 1 at uniform usage, I at total collapse to one feature.
+        self._last_aux_loss = self.intermediate * (load_norm * imp_norm).sum()
 
         # Router training: cross-entropy of router scores against true top-K.
         if self.router is not None:

@@ -8,7 +8,9 @@ These tests verify:
   - Router approximation produces correct shape and improves with oversample
   - State-dict / config consistency assertions catch mismatches
   - FfnCache returns the same output on hit
-  - Aux losses are populated after training forward
+  - Aux losses are populated after training forward and have O(1) scale
+    (i.e. don't suffer from the K^2 scaling regression caught by the first
+    smoke test — see docs/results.md Phase A)
 """
 
 import pytest
@@ -281,6 +283,35 @@ def test_aux_loss_is_finite_and_nonneg():
     assert torch.isfinite(router_l).item()
     assert aux_l.item() >= 0
     assert router_l.item() >= 0
+
+
+def test_aux_loss_bounded_by_intermediate():
+    """Switch-Transformer eq.4 aux loss is bounded above by intermediate.
+
+    Regression guard: an earlier version multiplied (load * importance) by
+    intermediate without normalizing either to a probability distribution,
+    which caused aux to scale as K^2 * intermediate and dominate the LM
+    loss (see docs/results.md Phase A). The fixed formula normalizes both
+    to distributions, so under the formula aux is bounded by `intermediate`
+    (the maximum at total collapse to one feature).
+
+    With random inputs we should be near the lower bound of 1.
+    """
+    torch.manual_seed(17)
+    # Pick a config where the buggy K^2 scaling would obviously violate
+    # the bound (K^2 = 1024 vs intermediate = 128).
+    config = _FakeConfig(n_embd=32, sparse_k=32)
+    mlp = TopKSparseMLP(config)
+    mlp.train()
+    x = torch.randn(4, 64, 32)
+    _ = mlp(x)
+    aux_l, _ = mlp.aux_loss()
+    intermediate = 4 * config.n_embd
+    assert aux_l.item() <= intermediate + 1e-3, (
+        f"aux_loss = {aux_l.item():.4f} exceeds intermediate={intermediate}. "
+        f"Under the Switch eq.4 formula (normalized importance and load) this "
+        f"is impossible. The K^2 scaling regression may have returned."
+    )
 
 
 def test_ffn_cache_eviction_bounded():
