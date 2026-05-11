@@ -1,5 +1,9 @@
 # Sparse FFN Results
 
+_Canonical empty template. Copy this file (e.g. to `results.md` for the
+primary d12 run, or to a new `results_<tag>.md` for a follow-on d24 run)
+and fill it in as each phase completes._
+
 _To be populated by the Train/Test team as runs complete._
 
 ## Phase 0 — Baseline Path Sanity
