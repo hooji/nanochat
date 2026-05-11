@@ -37,6 +37,15 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # ---- Sparse FFN (opt-in). All defaults preserve vanilla behavior. ----
+    # See nanochat/sparse/docs/README.md for the design.
+    sparse_ffn: bool = False               # master switch; when False, MLP runs unchanged
+    sparse_k: int = 256                    # active set size (intermediate=4*n_embd, K/intermediate = sparsity)
+    sparse_use_router: bool = False        # Tier 2: low-rank predictor of active set
+    sparse_router_rank: int = 64           # router rank when use_router=True
+    sparse_router_oversample: int = 2      # K' = K * this at inference
+    sparse_aux_loss_coef: float = 0.01     # load-balancing aux loss weight in total loss
+    sparse_router_loss_coef: float = 0.1   # router cross-entropy coefficient in total loss
 
 
 def norm(x):
@@ -143,7 +152,13 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        # Opt-in sparse FFN. When config.sparse_ffn is False (default), this branch
+        # is not taken and the vanilla MLP is used — the rest of the file is unchanged.
+        if config.sparse_ffn:
+            from nanochat.sparse.sparse_mlp import TopKSparseMLP
+            self.mlp = TopKSparseMLP(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -228,6 +243,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # Sparse FFN: init router weights if present (no-op for vanilla MLP).
+            # Using hasattr so this line is safe whether the MLP is TopKSparseMLP or vanilla.
+            if hasattr(block.mlp, "init_router_weights"):
+                block.mlp.init_router_weights()
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -475,6 +494,14 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Sparse FFN: add load-balancing + router aux losses (only when sparse_ffn=True).
+            if self.config.sparse_ffn:
+                from nanochat.sparse.sparse_mlp import collect_aux_losses
+                aux_total, router_total = collect_aux_losses(self)
+                loss = loss + (
+                    self.config.sparse_aux_loss_coef * aux_total
+                    + self.config.sparse_router_loss_coef * router_total
+                )
             return loss
         else:
             # inference: just return the logits directly

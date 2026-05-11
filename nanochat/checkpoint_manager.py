@@ -26,6 +26,16 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Sparse FFN fields: default to disabled so old checkpoints round-trip cleanly.
+    if "sparse_ffn" not in model_config_kwargs:
+        model_config_kwargs["sparse_ffn"] = False
+        model_config_kwargs.setdefault("sparse_k", 256)
+        model_config_kwargs.setdefault("sparse_use_router", False)
+        model_config_kwargs.setdefault("sparse_router_rank", 64)
+        model_config_kwargs.setdefault("sparse_router_oversample", 2)
+        model_config_kwargs.setdefault("sparse_aux_loss_coef", 0.01)
+        model_config_kwargs.setdefault("sparse_router_loss_coef", 0.1)
+        log0("Patching missing sparse_ffn config keys; defaulting to vanilla (disabled).")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -103,6 +113,11 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    # Sparse FFN: assert state_dict shape matches the config's router setting.
+    # Catches the case where someone hand-edits config but the checkpoint disagrees.
+    if model_config.sparse_ffn:
+        from nanochat.sparse.sparse_mlp import assert_state_dict_consistency
+        assert_state_dict_consistency(model, model_data)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

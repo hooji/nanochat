@@ -52,6 +52,15 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Sparse FFN (opt-in). All flags default to disabled; absent flags reproduce the vanilla code path bit-for-bit.
+# See nanochat/sparse/docs/README.md for the design.
+parser.add_argument("--sparse-ffn", action="store_true", help="enable opt-in TopK sparse FFN training")
+parser.add_argument("--sparse-k", type=int, default=256, help="active set size per token (only used with --sparse-ffn)")
+parser.add_argument("--sparse-use-router", action="store_true", help="enable Tier 2 router (predicted active sets)")
+parser.add_argument("--sparse-router-rank", type=int, default=64, help="router low-rank dim (only with --sparse-use-router)")
+parser.add_argument("--sparse-router-oversample", type=int, default=2, help="router K' = K * oversample (only with --sparse-use-router)")
+parser.add_argument("--sparse-aux-loss-coef", type=float, default=0.01, help="load-balancing aux loss coefficient (only with --sparse-ffn)")
+parser.add_argument("--sparse-router-loss-coef", type=float, default=0.1, help="router cross-entropy coefficient (only with --sparse-use-router)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +146,14 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        # Sparse FFN (defaults to disabled; absent --sparse-ffn means identical to master).
+        sparse_ffn=args.sparse_ffn,
+        sparse_k=args.sparse_k,
+        sparse_use_router=args.sparse_use_router,
+        sparse_router_rank=args.sparse_router_rank,
+        sparse_router_oversample=args.sparse_router_oversample,
+        sparse_aux_loss_coef=args.sparse_aux_loss_coef,
+        sparse_router_loss_coef=args.sparse_router_loss_coef,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
