@@ -61,6 +61,7 @@ parser.add_argument("--sparse-router-rank", type=int, default=64, help="router l
 parser.add_argument("--sparse-router-oversample", type=int, default=2, help="router K' = K * oversample (only with --sparse-use-router)")
 parser.add_argument("--sparse-aux-loss-coef", type=float, default=0.01, help="load-balancing aux loss coefficient (only with --sparse-ffn)")
 parser.add_argument("--sparse-router-loss-coef", type=float, default=0.1, help="router cross-entropy coefficient (only with --sparse-use-router)")
+parser.add_argument("--sparse-router-lr-multiplier", type=float, default=5.0, help="LR multiplier for router params vs matrix_lr (only with --sparse-use-router; routes router into its own Muon group)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -330,6 +331,8 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    # Sparse FFN router LR multiplier (only used when --sparse-use-router)
+    sparse_router_lr_multiplier=args.sparse_router_lr_multiplier,
 )
 
 if resuming:

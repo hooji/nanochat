@@ -390,7 +390,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, sparse_router_lr_multiplier=5.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -402,7 +402,19 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+
+        # Sparse FFN: pull router params out of matrix_params for their own Muon group with
+        # a multiplied LR. Router targets are non-stationary (top-K of c_fc, which keeps
+        # moving), so the router needs sustained LR to track. See nanochat/sparse/docs/results.md
+        # for the diagnostic (router learning collapsed by 260x under cosine decay).
+        router_params = []
+        if self.config.sparse_ffn and self.config.sparse_use_router:
+            from nanochat.sparse.sparse_mlp import gather_router_params
+            router_params = gather_router_params(self)
+            router_param_ids = {id(p) for p in router_params}
+            matrix_params = [p for p in matrix_params if id(p) not in router_param_ids]
+
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(router_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -425,6 +437,16 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
+        # Muon groups for sparse FFN router params (separate; same schedule via lrm, but higher initial LR).
+        if router_params:
+            router_lr = matrix_lr * sparse_router_lr_multiplier
+            print0(f"Sparse FFN router: {len(router_params)} params, lr = matrix_lr * {sparse_router_lr_multiplier} = {router_lr:.6f}")
+            for shape in sorted({p.shape for p in router_params}):
+                shape_group = [p for p in router_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=shape_group, lr=router_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
